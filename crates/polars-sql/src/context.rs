@@ -411,9 +411,8 @@ impl InnerSQLContext {
     }
 
     /// Execute a query in an isolated context. This prevents subqueries from mutating
-    /// arenas and other context state. Returns both the LazyFrame *and* its associated
-    /// Schema (so that the correct arenas are used when determining schema).
-    pub(crate) fn execute_isolated<F>(&mut self, query: F) -> PolarsResult<(LazyFrame, SchemaRef)>
+    /// arenas and other context state.
+    pub(crate) fn execute_isolated<F>(&mut self, query: F) -> PolarsResult<LazyFrame>
     where
         F: FnOnce(&mut Self) -> PolarsResult<LazyFrame>,
     {
@@ -429,8 +428,7 @@ impl InnerSQLContext {
         );
 
         // Execute query with clean state (eg: nested/subquery)
-        let mut lf = query(self)?;
-        let schema = self.get_frame_schema(&mut lf)?;
+        let lf = query(self)?;
 
         // Restore saved state
         lf.set_cached_arena(
@@ -441,7 +439,7 @@ impl InnerSQLContext {
         self.table_aliases = table_aliases;
         self.table_map = table_map;
 
-        Ok((lf, schema))
+        Ok(lf)
     }
 
     fn expr_or_ordinal(
@@ -608,33 +606,51 @@ impl InnerSQLContext {
             _ => (JoinType::Semi, "INTERSECT"),
         };
 
+        let quantifier = *quantifier;
+        let op_name_owned = op_name.to_string();
+
         // Note: each side of the EXCEPT/INTERSECT operation should execute
         // in isolation to prevent context state leakage between them
-        let (mut lf, _) = self.execute_isolated(|ctx| ctx.process_query(left, query))?;
-        let (mut rf, _) = self.execute_isolated(|ctx| ctx.process_query(right, query))?;
-        let lf_schema = self.get_frame_schema(&mut lf)?;
+        let lf = self.execute_isolated(|ctx| ctx.process_query(left, query))?;
+        let rf = self.execute_isolated(|ctx| ctx.process_query(right, query))?;
 
-        let lf_cols: Vec<_> = lf_schema.iter_names_cloned().map(col).collect();
-        let rf_cols = match quantifier {
-            SetQuantifier::ByName => None,
-            SetQuantifier::Distinct | SetQuantifier::None => {
-                let rf_schema = self.get_frame_schema(&mut rf)?;
-                let rf_cols: Vec<_> = rf_schema.iter_names_cloned().map(col).collect();
-                if lf_cols.len() != rf_cols.len() {
-                    polars_bail!(SQLInterface: "{} requires equal number of columns in each table (use '{} BY NAME' to combine mismatched tables)", op_name, op_name)
-                }
-                Some(rf_cols)
+        let cb = PlanCallback::new(
+            move |(mut plans, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
+                let rf = LazyFrame::from(plans.pop().unwrap());
+                let lf = LazyFrame::from(plans.pop().unwrap());
+                let lf_schema = &schemas[0];
+                let rf_schema = &schemas[1];
+
+                let lf_cols: Vec<_> = lf_schema.iter_names_cloned().map(col).collect();
+                let rf_cols = match quantifier {
+                    SetQuantifier::ByName => None,
+                    SetQuantifier::Distinct | SetQuantifier::None => {
+                        let rf_cols: Vec<_> = rf_schema.iter_names_cloned().map(col).collect();
+                        if lf_cols.len() != rf_cols.len() {
+                            polars_bail!(SQLInterface: "{} requires equal number of columns in each table (use '{} BY NAME' to combine mismatched tables)", op_name_owned, op_name_owned)
+                        }
+                        Some(rf_cols)
+                    },
+                    _ => {
+                        polars_bail!(SQLInterface: "'{} {}' is not supported", op_name_owned, quantifier.to_string())
+                    },
+                };
+                let join = lf
+                    .join_builder()
+                    .with(rf)
+                    .how(join_type.clone())
+                    .join_nulls(true);
+                let joined_tbl = match rf_cols {
+                    Some(rf_cols) => join.left_on(lf_cols).right_on(rf_cols).finish(),
+                    None => join.on(lf_cols).finish(),
+                };
+                Ok(joined_tbl
+                    .unique(None, UniqueKeepStrategy::Any)
+                    .logical_plan)
             },
-            _ => {
-                polars_bail!(SQLInterface: "'{} {}' is not supported", op_name, quantifier.to_string())
-            },
-        };
-        let join = lf.join_builder().with(rf).how(join_type).join_nulls(true);
-        let joined_tbl = match rf_cols {
-            Some(rf_cols) => join.left_on(lf_cols).right_on(rf_cols).finish(),
-            None => join.on(lf_cols).finish(),
-        };
-        Ok(joined_tbl.unique(None, UniqueKeepStrategy::Any))
+        );
+
+        Ok(lf.pipe_with_schemas(vec![rf], cb))
     }
 
     fn process_union(
@@ -648,8 +664,8 @@ impl InnerSQLContext {
 
         // Note: each side of the UNION operation should execute
         // in isolation to prevent context state leakage between them
-        let (lf, _) = self.execute_isolated(|ctx| ctx.process_query(left, query))?;
-        let (rf, _) = self.execute_isolated(|ctx| ctx.process_query(right, query))?;
+        let lf = self.execute_isolated(|ctx| ctx.process_query(left, query))?;
+        let rf = self.execute_isolated(|ctx| ctx.process_query(right, query))?;
 
         let cb = PlanCallback::new(
             move |(mut plans, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {

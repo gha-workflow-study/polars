@@ -299,11 +299,12 @@ impl SQLExprVisitor<'_> {
         }
         // note: we have to execute subqueries in an isolated scope to prevent
         // propagating any context/arena mutation into the rest of the query
-        let (lf, schema) = self
+        let mut lf = self
             .ctx
             .execute_isolated(|ctx| ctx.execute_query_no_ctes(subquery))?;
 
         if restriction == SubqueryRestriction::SingleColumn {
+            let schema = lf.schema_with_arenas(&mut self.ctx.lp_arena, &mut self.ctx.expr_arena)?;
             if schema.len() != 1 {
                 polars_bail!(SQLSyntax: "SQL subquery returns more than one column");
             }
