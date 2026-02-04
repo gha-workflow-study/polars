@@ -26,12 +26,12 @@ use sqlparser::ast::{
 };
 use sqlparser::tokenizer::Span;
 
-use crate::SQLContext;
+use crate::InnerSQLContext;
 use crate::sql_expr::{adjust_one_indexed_param, parse_extract_date_part, parse_sql_expr};
 
 pub(crate) struct SQLFunctionVisitor<'a> {
     pub(crate) func: &'a SQLFunction,
-    pub(crate) ctx: &'a mut SQLContext,
+    pub(crate) ctx: &'a mut InnerSQLContext,
     pub(crate) active_schema: Option<&'a Schema>,
 }
 
@@ -887,7 +887,7 @@ impl PolarsSQLFunctions {
 }
 
 impl PolarsSQLFunctions {
-    fn try_from_sql(function: &'_ SQLFunction, ctx: &'_ SQLContext) -> PolarsResult<Self> {
+    fn try_from_sql(function: &'_ SQLFunction, ctx: &'_ InnerSQLContext) -> PolarsResult<Self> {
         let function_name = function.name.0[0].as_ident().unwrap().value.to_lowercase();
         Ok(match function_name.as_str() {
             // ----
@@ -2358,13 +2358,13 @@ fn _extract_func_args(
 }
 
 pub(crate) trait FromSQLExpr {
-    fn from_sql_expr(expr: &SQLExpr, ctx: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, ctx: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized;
 }
 
 impl FromSQLExpr for f64 {
-    fn from_sql_expr(expr: &SQLExpr, _ctx: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, _ctx: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized,
     {
@@ -2381,7 +2381,7 @@ impl FromSQLExpr for f64 {
 }
 
 impl FromSQLExpr for bool {
-    fn from_sql_expr(expr: &SQLExpr, _ctx: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, _ctx: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized,
     {
@@ -2396,7 +2396,7 @@ impl FromSQLExpr for bool {
 }
 
 impl FromSQLExpr for String {
-    fn from_sql_expr(expr: &SQLExpr, _: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, _: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized,
     {
@@ -2411,7 +2411,7 @@ impl FromSQLExpr for String {
 }
 
 impl FromSQLExpr for StrptimeOptions {
-    fn from_sql_expr(expr: &SQLExpr, _: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, _: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized,
     {
@@ -2429,7 +2429,7 @@ impl FromSQLExpr for StrptimeOptions {
 }
 
 impl FromSQLExpr for Expr {
-    fn from_sql_expr(expr: &SQLExpr, ctx: &mut SQLContext) -> PolarsResult<Self>
+    fn from_sql_expr(expr: &SQLExpr, ctx: &mut InnerSQLContext) -> PolarsResult<Self>
     where
         Self: Sized,
     {

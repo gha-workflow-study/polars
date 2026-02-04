@@ -26,11 +26,11 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserOptions};
 
-use crate::SQLContext;
 use crate::functions::SQLFunctionVisitor;
 use crate::types::{
     bitstring_to_bytes_literal, is_iso_date, is_iso_datetime, is_iso_time, map_sql_dtype_to_polars,
 };
+use crate::{InnerSQLContext, SQLContext};
 
 #[inline]
 #[cold]
@@ -53,7 +53,7 @@ pub enum SubqueryRestriction {
 
 /// Recursively walks a SQL Expr to create a polars Expr
 pub(crate) struct SQLExprVisitor<'a> {
-    ctx: &'a mut SQLContext,
+    ctx: &'a mut InnerSQLContext,
     active_schema: Option<&'a Schema>,
 }
 
@@ -1183,7 +1183,8 @@ impl SQLExprVisitor<'_> {
 /// # }
 /// ```
 pub fn sql_expr<S: AsRef<str>>(s: S) -> PolarsResult<Expr> {
-    let mut ctx = SQLContext::new();
+    let ctx = SQLContext::new();
+    let mut inner = ctx.inner_mut();
 
     let mut parser = Parser::new(&GenericDialect);
     parser = parser.with_options(ParserOptions {
@@ -1198,10 +1199,10 @@ pub fn sql_expr<S: AsRef<str>>(s: S) -> PolarsResult<Expr> {
 
     Ok(match &expr {
         SelectItem::ExprWithAlias { expr, alias } => {
-            let expr = parse_sql_expr(expr, &mut ctx, None)?;
+            let expr = parse_sql_expr(expr, &mut inner, None)?;
             expr.alias(alias.value.as_str())
         },
-        SelectItem::UnnamedExpr(expr) => parse_sql_expr(expr, &mut ctx, None)?,
+        SelectItem::UnnamedExpr(expr) => parse_sql_expr(expr, &mut inner, None)?,
         _ => polars_bail!(SQLInterface: "unable to parse '{}' as Expr", s.as_ref()),
     })
 }
@@ -1243,14 +1244,14 @@ pub(crate) fn interval_to_duration(interval: &Interval, fixed: bool) -> PolarsRe
 
 pub(crate) fn parse_sql_expr(
     expr: &SQLExpr,
-    ctx: &mut SQLContext,
+    ctx: &mut InnerSQLContext,
     active_schema: Option<&Schema>,
 ) -> PolarsResult<Expr> {
     let mut visitor = SQLExprVisitor { ctx, active_schema };
     visitor.visit_expr(expr)
 }
 
-pub(crate) fn parse_sql_array(expr: &SQLExpr, ctx: &mut SQLContext) -> PolarsResult<Series> {
+pub(crate) fn parse_sql_array(expr: &SQLExpr, ctx: &mut InnerSQLContext) -> PolarsResult<Series> {
     match expr {
         SQLExpr::Array(arr) => {
             let mut visitor = SQLExprVisitor {
@@ -1381,7 +1382,7 @@ pub(crate) fn adjust_one_indexed_param(idx: Expr, null_if_zero: bool) -> Expr {
 }
 
 fn resolve_column<'a>(
-    ctx: &'a mut SQLContext,
+    ctx: &'a mut InnerSQLContext,
     ident_root: &'a Ident,
     name: &'a str,
     dtype: &'a DataType,
@@ -1399,7 +1400,7 @@ fn resolve_column<'a>(
 }
 
 pub(crate) fn resolve_compound_identifier(
-    ctx: &mut SQLContext,
+    ctx: &mut InnerSQLContext,
     idents: &[Ident],
     active_schema: Option<&Schema>,
 ) -> PolarsResult<Vec<Expr>> {

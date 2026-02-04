@@ -1,4 +1,5 @@
 use std::ops::Deref;
+use std::sync::{Arc, RwLock};
 
 use polars_core::frame::row::Row;
 use polars_core::prelude::*;
@@ -139,11 +140,10 @@ fn disambiguate_projection_cols(
     Ok(result)
 }
 
-/// The SQLContext is the main entry point for executing SQL queries.
-#[derive(Clone)]
-pub struct SQLContext {
+/// Inner mutable state of SQLContext, protected by RwLock for interior mutability.
+pub struct InnerSQLContext {
     pub(crate) table_map: PlHashMap<String, LazyFrame>,
-    pub(crate) function_registry: Arc<dyn FunctionRegistry>,
+    pub(crate) function_registry: std::sync::Arc<dyn FunctionRegistry>,
     pub(crate) lp_arena: Arena<IR>,
     pub(crate) expr_arena: Arena<AExpr>,
 
@@ -153,10 +153,10 @@ pub struct SQLContext {
     pub(crate) named_windows: PlHashMap<String, WindowSpec>,
 }
 
-impl Default for SQLContext {
+impl Default for InnerSQLContext {
     fn default() -> Self {
         Self {
-            function_registry: Arc::new(DefaultFunctionRegistry {}),
+            function_registry: std::sync::Arc::new(DefaultFunctionRegistry {}),
             table_map: Default::default(),
             cte_map: Default::default(),
             table_aliases: Default::default(),
@@ -164,6 +164,24 @@ impl Default for SQLContext {
             named_windows: Default::default(),
             lp_arena: Default::default(),
             expr_arena: Default::default(),
+        }
+    }
+}
+
+/// The SQLContext is the main entry point for executing SQL queries.
+///
+/// This type uses interior mutability via `Arc<RwLock<...>>` so that clones
+/// share the same underlying state. This allows callbacks (e.g., in `pipe_with_schema`)
+/// to observe and modify the same context state as the original caller.
+#[derive(Clone)]
+pub struct SQLContext {
+    inner: Arc<RwLock<InnerSQLContext>>,
+}
+
+impl Default for SQLContext {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InnerSQLContext::default())),
         }
     }
 }
@@ -182,7 +200,8 @@ impl SQLContext {
 
     /// Get the names of all registered tables, in sorted order.
     pub fn get_tables(&self) -> Vec<String> {
-        let mut tables = Vec::from_iter(self.table_map.keys().cloned());
+        let inner = self.inner.read().unwrap();
+        let mut tables = Vec::from_iter(inner.table_map.keys().cloned());
         tables.sort_unstable();
         tables
     }
@@ -194,7 +213,7 @@ impl SQLContext {
     /// # use polars_lazy::prelude::*;
     /// # fn main() {
     ///
-    /// let mut ctx = SQLContext::new();
+    /// let ctx = SQLContext::new();
     /// let df = df! {
     ///    "a" =>  [1, 2, 3],
     /// }.unwrap().lazy();
@@ -202,13 +221,15 @@ impl SQLContext {
     /// ctx.register("df", df);
     /// # }
     ///```
-    pub fn register(&mut self, name: &str, lf: LazyFrame) {
-        self.table_map.insert(name.to_owned(), lf);
+    pub fn register(&self, name: &str, lf: LazyFrame) {
+        let mut inner = self.inner.write().unwrap();
+        inner.table_map.insert(name.to_owned(), lf);
     }
 
     /// Unregister a [`LazyFrame`] table from the [`SQLContext`].
-    pub fn unregister(&mut self, name: &str) {
-        self.table_map.remove(&name.to_owned());
+    pub fn unregister(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.table_map.remove(&name.to_owned());
     }
 
     /// Execute a SQL query, returning a [`LazyFrame`].
@@ -218,7 +239,7 @@ impl SQLContext {
     /// # use polars_lazy::prelude::*;
     /// # fn main() {
     ///
-    /// let mut ctx = SQLContext::new();
+    /// let ctx = SQLContext::new();
     /// let df = df! {
     ///    "a" =>  [1, 2, 3],
     /// }
@@ -229,7 +250,69 @@ impl SQLContext {
     /// assert!(sql_df.equals(&df));
     /// # }
     ///```
-    pub fn execute(&mut self, query: &str) -> PolarsResult<LazyFrame> {
+    pub fn execute(&self, query: &str) -> PolarsResult<LazyFrame> {
+        let mut inner = self.inner.write().unwrap();
+        inner.execute(query)
+    }
+
+    /// Add a function registry to the SQLContext.
+    /// The registry provides the ability to add custom functions to the SQLContext.
+    pub fn with_function_registry(
+        self,
+        function_registry: std::sync::Arc<dyn FunctionRegistry>,
+    ) -> Self {
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.function_registry = function_registry;
+        }
+        self
+    }
+
+    /// Get the function registry of the SQLContext.
+    ///
+    /// Note: Returns a clone of the Arc to avoid holding a lock.
+    pub fn registry(&self) -> std::sync::Arc<dyn FunctionRegistry> {
+        let inner = self.inner.read().unwrap();
+        inner.function_registry.clone()
+    }
+
+    /// Get a mutable reference to the function registry of the SQLContext.
+    ///
+    /// # Panics
+    /// Panics if the Arc has other strong references (i.e., the registry is shared).
+    pub fn registry_mut(&self) -> impl std::ops::DerefMut<Target = dyn FunctionRegistry> + '_ {
+        struct RegistryGuard<'a> {
+            inner: std::sync::RwLockWriteGuard<'a, InnerSQLContext>,
+        }
+        impl std::ops::Deref for RegistryGuard<'_> {
+            type Target = dyn FunctionRegistry;
+            fn deref(&self) -> &Self::Target {
+                self.inner.function_registry.as_ref()
+            }
+        }
+        impl std::ops::DerefMut for RegistryGuard<'_> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                std::sync::Arc::get_mut(&mut self.inner.function_registry).unwrap()
+            }
+        }
+        RegistryGuard {
+            inner: self.inner.write().unwrap(),
+        }
+    }
+
+    /// Get mutable access to the inner context (for internal use).
+    pub(crate) fn inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, InnerSQLContext> {
+        self.inner.write().unwrap()
+    }
+
+    /// Get read access to the inner context (for internal use).
+    pub(crate) fn inner(&self) -> std::sync::RwLockReadGuard<'_, InnerSQLContext> {
+        self.inner.read().unwrap()
+    }
+}
+
+impl InnerSQLContext {
+    fn execute(&mut self, query: &str) -> PolarsResult<LazyFrame> {
         let mut parser = Parser::new(&GenericDialect);
         parser = parser.with_options(ParserOptions {
             trailing_commas: true,
@@ -259,26 +342,9 @@ impl SQLContext {
 
         Ok(res)
     }
-
-    /// Add a function registry to the SQLContext.
-    /// The registry provides the ability to add custom functions to the SQLContext.
-    pub fn with_function_registry(mut self, function_registry: Arc<dyn FunctionRegistry>) -> Self {
-        self.function_registry = function_registry;
-        self
-    }
-
-    /// Get the function registry of the SQLContext
-    pub fn registry(&self) -> &Arc<dyn FunctionRegistry> {
-        &self.function_registry
-    }
-
-    /// Get a mutable reference to the function registry of the SQLContext
-    pub fn registry_mut(&mut self) -> &mut dyn FunctionRegistry {
-        Arc::get_mut(&mut self.function_registry).unwrap()
-    }
 }
 
-impl SQLContext {
+impl InnerSQLContext {
     pub(crate) fn execute_statement(&mut self, stmt: &Statement) -> PolarsResult<LazyFrame> {
         let ast = stmt;
         Ok(match ast {
@@ -742,7 +808,9 @@ impl SQLContext {
 
     // SHOW TABLES
     fn execute_show_tables(&mut self, _: &Statement) -> PolarsResult<LazyFrame> {
-        let tables = Column::new("name".into(), self.get_tables());
+        let mut tables = Vec::from_iter(self.table_map.keys().cloned());
+        tables.sort_unstable();
+        let tables = Column::new("name".into(), tables);
         let df = DataFrame::new_infer_height(vec![tables])?;
         Ok(df.lazy())
     }
@@ -1740,7 +1808,7 @@ impl SQLContext {
                     )
                 },
             };
-            self.register(tbl_name, lf);
+            self.table_map.insert(tbl_name.to_owned(), lf);
 
             let df_created = df! { "Response" => [format!("CREATE TABLE {}", name.0.first().unwrap().as_ident().unwrap().value)] };
             Ok(df_created.unwrap().lazy())
@@ -2355,14 +2423,17 @@ impl SQLContext {
 impl SQLContext {
     /// Get internal table map. For internal use only.
     pub fn get_table_map(&self) -> PlHashMap<String, LazyFrame> {
-        self.table_map.clone()
+        let inner = self.inner.read().unwrap();
+        inner.table_map.clone()
     }
 
     /// Create a new SQLContext from a table map. For internal use only
     pub fn new_from_table_map(table_map: PlHashMap<String, LazyFrame>) -> Self {
         Self {
-            table_map,
-            ..Default::default()
+            inner: Arc::new(RwLock::new(InnerSQLContext {
+                table_map,
+                ..Default::default()
+            })),
         }
     }
 }
@@ -2494,7 +2565,7 @@ fn expr_cols_all_in_schema(expr: &Expr, schema: &Schema) -> bool {
 /// we join `df2` to `df3` could refer to `df1.a = df3.b`; this takes a little more work to
 /// resolve as our native `join` function operates on only two tables at a time.
 fn determine_left_right_join_on(
-    ctx: &mut SQLContext,
+    ctx: &mut InnerSQLContext,
     expr_left: &SQLExpr,
     expr_right: &SQLExpr,
     tbl_left: &TableInfo,
@@ -2571,7 +2642,7 @@ fn determine_left_right_join_on(
 }
 
 fn process_join_on(
-    ctx: &mut SQLContext,
+    ctx: &mut InnerSQLContext,
     sql_expr: &SQLExpr,
     tbl_left: &TableInfo,
     tbl_right: &TableInfo,
@@ -2620,7 +2691,7 @@ fn process_join_constraint(
     constraint: &JoinConstraint,
     tbl_left: &TableInfo,
     tbl_right: &TableInfo,
-    ctx: &mut SQLContext,
+    ctx: &mut InnerSQLContext,
 ) -> PolarsResult<(Vec<Expr>, Vec<Expr>)> {
     match constraint {
         JoinConstraint::On(expr @ SQLExpr::BinaryOp { .. }) => {
