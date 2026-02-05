@@ -32,6 +32,14 @@ use crate::sql_visitors::{
 use crate::table_functions::PolarsTableFunctions;
 use crate::types::map_sql_dtype_to_polars;
 
+fn clear_lf(lf: LazyFrame) -> LazyFrame {
+    let cb = PlanCallback::new(move |(_, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
+        let schema = &schemas[0];
+        Ok(DataFrame::empty_with_schema(schema).lazy().logical_plan)
+    });
+    lf.pipe_with_schema(cb)
+}
+
 #[derive(Clone)]
 pub struct TableInfo {
     pub(crate) frame: LazyFrame,
@@ -168,6 +176,14 @@ impl Default for InnerSQLContext {
     }
 }
 
+impl InnerSQLContext {
+    fn get_tables(&self) -> Vec<String> {
+        let mut tables = Vec::from_iter(self.table_map.keys().cloned());
+        tables.sort_unstable();
+        tables
+    }
+}
+
 /// The SQLContext is the main entry point for executing SQL queries.
 ///
 /// This type uses interior mutability via `Arc<RwLock<...>>` so that clones
@@ -201,9 +217,7 @@ impl SQLContext {
     /// Get the names of all registered tables, in sorted order.
     pub fn get_tables(&self) -> Vec<String> {
         let inner = self.inner.read().unwrap();
-        let mut tables = Vec::from_iter(inner.table_map.keys().cloned());
-        tables.sort_unstable();
-        tables
+        inner.get_tables()
     }
 
     /// Register a [`LazyFrame`] as a table in the SQLContext.
@@ -303,11 +317,6 @@ impl SQLContext {
     /// Get mutable access to the inner context (for internal use).
     pub(crate) fn inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, InnerSQLContext> {
         self.inner.write().unwrap()
-    }
-
-    /// Get read access to the inner context (for internal use).
-    pub(crate) fn inner(&self) -> std::sync::RwLockReadGuard<'_, InnerSQLContext> {
-        self.inner.read().unwrap()
     }
 }
 
@@ -824,9 +833,7 @@ impl InnerSQLContext {
 
     // SHOW TABLES
     fn execute_show_tables(&mut self, _: &Statement) -> PolarsResult<LazyFrame> {
-        let mut tables = Vec::from_iter(self.table_map.keys().cloned());
-        tables.sort_unstable();
-        let tables = Column::new("name".into(), tables);
+        let tables = Column::new("name".into(), self.get_tables());
         let df = DataFrame::new_infer_height(vec![tables])?;
         Ok(df.lazy())
     }
@@ -884,14 +891,13 @@ impl InnerSQLContext {
             if !tbl_expr.joins.is_empty() {
                 polars_bail!(SQLInterface: "DELETE does not support table JOINs")
             }
-            let (_, mut lf) = self.get_table(&tbl_expr.relation)?;
-            let schema = self.get_frame_schema(&mut lf)?;
+            let (_, lf) = self.get_table(&tbl_expr.relation)?;
             if selection.is_none() {
                 // no WHERE clause; equivalent to TRUNCATE (drop all rows)
-                Ok(DataFrame::empty_with_schema(&schema).lazy())
+                Ok(clear_lf(lf))
             } else {
                 // apply constraint as inverted filter (drops rows matching the selection)
-                Ok(self.process_where(lf.clone(), selection, true, &schema)?)
+                Ok(self.process_where(lf.clone(), selection, true)?)
             }
         } else {
             polars_bail!(SQLInterface: "unexpected statement type; expected DELETE")
@@ -1209,8 +1215,7 @@ impl InnerSQLContext {
         }
 
         // Apply `WHERE` constraint
-        let mut schema = self.get_frame_schema(&mut lf)?;
-        lf = self.process_where(lf, &select_stmt.selection, false, &schema)?;
+        lf = self.process_where(lf, &select_stmt.selection, false)?;
 
         // Determine projections
         let mut select_modifiers = SelectModifiers {
@@ -1623,11 +1628,10 @@ impl InnerSQLContext {
     }
 
     fn process_where(
-        &mut self,
+        &self,
         mut lf: LazyFrame,
         expr: &Option<SQLExpr>,
         invert_filter: bool,
-        schema: &Schema,
     ) -> PolarsResult<LazyFrame> {
         if let Some(expr) = expr {
             // shortcut filter evaluation if given expression is just TRUE or FALSE
@@ -1650,20 +1654,27 @@ impl InnerSQLContext {
             if (all_true && !invert_filter) || (all_false && invert_filter) {
                 return Ok(lf);
             } else if (all_false && !invert_filter) || (all_true && invert_filter) {
-                return Ok(DataFrame::empty_with_schema(schema).lazy());
+                return Ok(clear_lf(lf));
             }
 
             // ...otherwise parse and apply the filter as normal
-            let mut filter_expression = parse_sql_expr(expr, self, Some(schema))?;
-            if filter_expression.clone().meta().has_multiple_outputs() {
-                filter_expression = all_horizontal([filter_expression])?;
-            }
-            lf = self.process_subqueries(lf, vec![&mut filter_expression]);
-            lf = if invert_filter {
-                lf.remove(filter_expression)
-            } else {
-                lf.filter(filter_expression)
-            };
+
+            let cb = PlanCallback::new(move |(_, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
+                let schema = &schemas[0];
+                let mut filter_expression = parse_sql_expr(expr, self, Some(schema))?;
+                if filter_expression.clone().meta().has_multiple_outputs() {
+                    filter_expression = all_horizontal([filter_expression])?;
+                }
+                lf = process_subqueries(lf, vec![&mut filter_expression]);
+                lf = if invert_filter {
+                    lf.remove(filter_expression)
+                } else {
+                    lf.filter(filter_expression)
+                };
+
+                Ok(lf.logical_plan)
+            });
+            lf = lf.pipe_with_schema(cb);
         }
         Ok(lf)
     }
@@ -1724,40 +1735,6 @@ impl InnerSQLContext {
         Ok(lf)
     }
 
-    fn process_subqueries(&self, lf: LazyFrame, exprs: Vec<&mut Expr>) -> LazyFrame {
-        let mut subplans = vec![];
-
-        for e in exprs {
-            *e = e.clone().map_expr(|e| {
-                if let Expr::SubPlan(lp, names) = e {
-                    assert_eq!(
-                        names.len(),
-                        1,
-                        "multiple columns in subqueries not yet supported"
-                    );
-                    subplans.push(LazyFrame::from((**lp).clone()));
-                    Expr::Column(names[0].clone()).first()
-                } else {
-                    e
-                }
-            });
-        }
-
-        if subplans.is_empty() {
-            lf
-        } else {
-            subplans.insert(0, lf);
-            concat_lf_horizontal(
-                subplans,
-                HConcatOptions {
-                    broadcast_unit_length: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        }
-    }
-
     fn execute_create_table(&mut self, stmt: &Statement) -> PolarsResult<LazyFrame> {
         if let Statement::CreateTable(CreateTable {
             if_not_exists,
@@ -1808,13 +1785,7 @@ impl InnerSQLContext {
                         .value
                         .as_str();
                     if let Some(table) = self.table_map.get(like_table).cloned() {
-                        let cb = PlanCallback::new(
-                            move |(_, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
-                                let schema = &schemas[0];
-                                Ok(DataFrame::empty_with_schema(schema).lazy().logical_plan)
-                            },
-                        );
-                        table.pipe_with_schema(cb)
+                        clear_lf(lf)
                     } else {
                         polars_bail!(SQLInterface: "table given in LIKE does not exist: {}", like_table)
                     }
@@ -2848,5 +2819,39 @@ impl ExprSqlProjectionHeightBehavior {
         } else {
             Self::InheritsContext
         }
+    }
+}
+
+fn process_subqueries(lf: LazyFrame, exprs: Vec<&mut Expr>) -> LazyFrame {
+    let mut subplans = vec![];
+
+    for e in exprs {
+        *e = e.clone().map_expr(|e| {
+            if let Expr::SubPlan(lp, names) = e {
+                assert_eq!(
+                    names.len(),
+                    1,
+                    "multiple columns in subqueries not yet supported"
+                );
+                subplans.push(LazyFrame::from((**lp).clone()));
+                Expr::Column(names[0].clone()).first()
+            } else {
+                e
+            }
+        });
+    }
+
+    if subplans.is_empty() {
+        lf
+    } else {
+        subplans.insert(0, lf);
+        concat_lf_horizontal(
+            subplans,
+            HConcatOptions {
+                broadcast_unit_length: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 }

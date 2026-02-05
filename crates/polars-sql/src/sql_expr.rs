@@ -53,7 +53,7 @@ pub enum SubqueryRestriction {
 
 /// Recursively walks a SQL Expr to create a polars Expr
 pub(crate) struct SQLExprVisitor<'a> {
-    ctx: &'a mut InnerSQLContext,
+    ctx: &'a mut SQLContext,
     active_schema: Option<&'a Schema>,
 }
 
@@ -1245,14 +1245,14 @@ pub(crate) fn interval_to_duration(interval: &Interval, fixed: bool) -> PolarsRe
 
 pub(crate) fn parse_sql_expr(
     expr: &SQLExpr,
-    ctx: &mut InnerSQLContext,
+    ctx: &SQLContext,
     active_schema: Option<&Schema>,
 ) -> PolarsResult<Expr> {
     let mut visitor = SQLExprVisitor { ctx, active_schema };
     visitor.visit_expr(expr)
 }
 
-pub(crate) fn parse_sql_array(expr: &SQLExpr, ctx: &mut InnerSQLContext) -> PolarsResult<Series> {
+pub(crate) fn parse_sql_array(expr: &SQLExpr, ctx: &SQLContext) -> PolarsResult<Series> {
     match expr {
         SQLExpr::Array(arr) => {
             let mut visitor = SQLExprVisitor {
