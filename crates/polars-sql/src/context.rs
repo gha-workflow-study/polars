@@ -885,17 +885,13 @@ impl InnerSQLContext {
                 polars_bail!(SQLInterface: "DELETE does not support table JOINs")
             }
             let (_, mut lf) = self.get_table(&tbl_expr.relation)?;
+            let schema = self.get_frame_schema(&mut lf)?;
             if selection.is_none() {
                 // no WHERE clause; equivalent to TRUNCATE (drop all rows)
-                Ok(DataFrame::empty_with_schema(
-                    lf.schema_with_arenas(&mut self.lp_arena, &mut self.expr_arena)
-                        .unwrap()
-                        .as_ref(),
-                )
-                .lazy())
+                Ok(DataFrame::empty_with_schema(&schema).lazy())
             } else {
                 // apply constraint as inverted filter (drops rows matching the selection)
-                Ok(self.process_where(lf.clone(), selection, true, None)?)
+                Ok(self.process_where(lf.clone(), selection, true, &schema)?)
             }
         } else {
             polars_bail!(SQLInterface: "unexpected statement type; expected DELETE")
@@ -1214,7 +1210,7 @@ impl InnerSQLContext {
 
         // Apply `WHERE` constraint
         let mut schema = self.get_frame_schema(&mut lf)?;
-        lf = self.process_where(lf, &select_stmt.selection, false, Some(schema.clone()))?;
+        lf = self.process_where(lf, &select_stmt.selection, false, &schema)?;
 
         // Determine projections
         let mut select_modifiers = SelectModifiers {
@@ -1453,7 +1449,15 @@ impl InnerSQLContext {
             if !select_modifiers.rename.is_empty() {
                 lf = lf.with_columns(select_modifiers.renamed_cols());
             }
-            lf = self.process_order_by(lf, &query.order_by, Some(&retained_cols))?;
+            if have_order_by {
+                let order_by_schema = self.get_frame_schema(&mut lf)?;
+                lf = self.process_order_by(
+                    lf,
+                    &query.order_by,
+                    Some(&retained_cols),
+                    &order_by_schema,
+                )?;
+            }
 
             // Note: If `have_order_by`, with_columns is already done above.
             if projection_heights == ExprSqlProjectionHeightBehavior::InheritsContext
@@ -1478,8 +1482,9 @@ impl InnerSQLContext {
                 .as_ref()
                 .map(|expr| parse_sql_expr(expr, self, Some(&schema)))
                 .transpose()?;
-            lf = self.process_group_by(lf, &group_by_keys, &projections, having)?;
-            lf = self.process_order_by(lf, &query.order_by, None)?;
+            lf = self.process_group_by(lf, &group_by_keys, &projections, having, &schema)?;
+            let group_by_schema = self.get_frame_schema(&mut lf)?;
+            lf = self.process_order_by(lf, &query.order_by, None, &group_by_schema)?;
 
             // Drop any extra columns (eg: added to maintain ORDER BY access to original cols)
             let output_cols: Vec<_> = projections
@@ -1494,18 +1499,22 @@ impl InnerSQLContext {
         };
 
         // Apply optional QUALIFY clause (filters on window functions).
-        lf = self.process_qualify(lf, &select_stmt.qualify, &window_fn_columns)?;
+        if select_stmt.qualify.is_some() {
+            let output_schema = self.get_frame_schema(&mut lf)?;
+            lf =
+                self.process_qualify(lf, &select_stmt.qualify, &window_fn_columns, &output_schema)?;
+        }
 
         // Apply optional DISTINCT clause.
         lf = match &select_stmt.distinct {
             Some(Distinct::Distinct) => lf.unique_stable(None, UniqueKeepStrategy::Any),
             Some(Distinct::On(exprs)) => {
                 // TODO: support exprs in `unique` see https://github.com/pola-rs/polars/issues/5760
-                let schema = Some(self.get_frame_schema(&mut lf)?);
+                let output_schema = self.get_frame_schema(&mut lf)?;
                 let cols = exprs
                     .iter()
                     .map(|e| {
-                        let expr = parse_sql_expr(e, self, schema.as_deref())?;
+                        let expr = parse_sql_expr(e, self, Some(&output_schema))?;
                         if let Expr::Column(name) = expr {
                             Ok(name)
                         } else {
@@ -1515,7 +1524,7 @@ impl InnerSQLContext {
                     .collect::<PolarsResult<Vec<_>>>()?;
 
                 // DISTINCT ON has to apply the ORDER BY before the operation.
-                lf = self.process_order_by(lf, &query.order_by, None)?;
+                lf = self.process_order_by(lf, &query.order_by, None, &output_schema)?;
                 return Ok(lf.unique_stable(
                     Some(Selector::ByName {
                         names: cols.into(),
@@ -1618,14 +1627,9 @@ impl InnerSQLContext {
         mut lf: LazyFrame,
         expr: &Option<SQLExpr>,
         invert_filter: bool,
-        schema: Option<SchemaRef>,
+        schema: &Schema,
     ) -> PolarsResult<LazyFrame> {
         if let Some(expr) = expr {
-            let schema = match schema {
-                None => self.get_frame_schema(&mut lf)?,
-                Some(s) => s,
-            };
-
             // shortcut filter evaluation if given expression is just TRUE or FALSE
             let (all_true, all_false) = match expr {
                 SQLExpr::Value(ValueWithSpan {
@@ -1646,11 +1650,11 @@ impl InnerSQLContext {
             if (all_true && !invert_filter) || (all_false && invert_filter) {
                 return Ok(lf);
             } else if (all_false && !invert_filter) || (all_true && invert_filter) {
-                return Ok(DataFrame::empty_with_schema(schema.as_ref()).lazy());
+                return Ok(DataFrame::empty_with_schema(schema).lazy());
             }
 
             // ...otherwise parse and apply the filter as normal
-            let mut filter_expression = parse_sql_expr(expr, self, Some(schema).as_deref())?;
+            let mut filter_expression = parse_sql_expr(expr, self, Some(schema))?;
             if filter_expression.clone().meta().has_multiple_outputs() {
                 filter_expression = all_horizontal([filter_expression])?;
             }
@@ -1697,6 +1701,7 @@ impl InnerSQLContext {
         mut lf: LazyFrame,
         qualify_expr: &Option<SQLExpr>,
         window_fn_columns: &PlHashSet<String>,
+        schema: &Schema,
     ) -> PolarsResult<LazyFrame> {
         if let Some(expr) = qualify_expr {
             // Check the QUALIFY expression to identify window functions
@@ -1709,8 +1714,7 @@ impl InnerSQLContext {
                     "QUALIFY clause must reference window functions either explicitly or via SELECT aliases"
                 );
             }
-            let schema = self.get_frame_schema(&mut lf)?;
-            let mut filter_expression = parse_sql_expr(expr, self, Some(&schema))?;
+            let mut filter_expression = parse_sql_expr(expr, self, Some(schema))?;
             if filter_expression.clone().meta().has_multiple_outputs() {
                 filter_expression = all_horizontal([filter_expression])?;
             }
@@ -1803,9 +1807,14 @@ impl InnerSQLContext {
                         .unwrap()
                         .value
                         .as_str();
-                    if let Some(mut table) = self.table_map.get(like_table).cloned() {
-                        let schema = self.get_frame_schema(&mut table)?;
-                        DataFrame::empty_with_schema(&schema).lazy()
+                    if let Some(table) = self.table_map.get(like_table).cloned() {
+                        let cb = PlanCallback::new(
+                            move |(_, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
+                                let schema = &schemas[0];
+                                Ok(DataFrame::empty_with_schema(schema).lazy().logical_plan)
+                            },
+                        );
+                        table.pipe_with_schema(cb)
                     } else {
                         polars_bail!(SQLInterface: "table given in LIKE does not exist: {}", like_table)
                     }
@@ -1968,9 +1977,10 @@ impl InnerSQLContext {
 
     fn process_order_by(
         &mut self,
-        mut lf: LazyFrame,
+        lf: LazyFrame,
         order_by: &Option<OrderBy>,
         selected: Option<&[Expr]>,
+        schema: &Schema,
     ) -> PolarsResult<LazyFrame> {
         if order_by.as_ref().is_none_or(|ob| match &ob.kind {
             OrderByKind::Expressions(exprs) => exprs.is_empty(),
@@ -1978,7 +1988,6 @@ impl InnerSQLContext {
         }) {
             return Ok(lf);
         }
-        let schema = self.get_frame_schema(&mut lf)?;
         let columns_iter = schema.iter_names().map(|e| col(e.clone()));
         let (order_by, order_by_all, n_order_cols) = match &order_by.as_ref().unwrap().kind {
             OrderByKind::Expressions(exprs) => {
@@ -2051,14 +2060,14 @@ impl InnerSQLContext {
 
     fn process_group_by(
         &mut self,
-        mut lf: LazyFrame,
+        lf: LazyFrame,
         group_by_keys: &[Expr],
         projections: &[Expr],
         having: Option<Expr>,
+        schema_before: &Schema,
     ) -> PolarsResult<LazyFrame> {
-        let schema_before = self.get_frame_schema(&mut lf)?;
         let group_by_keys_schema =
-            expressions_to_schema(group_by_keys, &schema_before, |duplicate_name: &str| {
+            expressions_to_schema(group_by_keys, schema_before, |duplicate_name: &str| {
                 format!("group_by keys contained duplicate output name '{duplicate_name}'")
             })?;
 
@@ -2076,7 +2085,7 @@ impl InnerSQLContext {
             .map(|gk| {
                 (
                     strip_outer_alias(gk),
-                    gk.to_field(&schema_before).ok().map(|f| f.name),
+                    gk.to_field(schema_before).ok().map(|f| f.name),
                 )
             })
             .collect();
@@ -2085,7 +2094,7 @@ impl InnerSQLContext {
             .iter()
             .map(|p| {
                 let p_stripped = strip_outer_alias(p);
-                let p_name = p.to_field(&schema_before).ok().map(|f| f.name);
+                let p_name = p.to_field(schema_before).ok().map(|f| f.name);
                 group_key_data
                     .iter()
                     .any(|(gk_stripped, gk_name)| *gk_stripped == p_stripped && *gk_name == p_name)
@@ -2118,7 +2127,7 @@ impl InnerSQLContext {
             // Use `e_inner` to track the potentially unwrapped expression for field lookup.
             let mut e_inner = e;
             if let Expr::Alias(expr, alias) = e {
-                if e.clone().meta().is_simple_projection(Some(&schema_before)) {
+                if e.clone().meta().is_simple_projection(Some(schema_before)) {
                     group_key_aliases.insert(alias.as_ref());
                     e_inner = expr
                 } else if let Expr::Function {
@@ -2132,7 +2141,7 @@ impl InnerSQLContext {
                     projection_aliases.insert(alias.as_ref());
                 }
             }
-            let field = e_inner.to_field(&schema_before)?;
+            let field = e_inner.to_field(schema_before)?;
             if is_non_group_key_expr {
                 let mut e = e.clone();
                 if let Expr::Agg(AggExpr::Implode(expr)) = &e {
@@ -2176,7 +2185,7 @@ impl InnerSQLContext {
                     },
                     e @ (Expr::Agg(_) | Expr::Len) => Some((
                         e.clone(),
-                        e.to_field(&schema_before)
+                        e.to_field(schema_before)
                             .map(|f| f.name)
                             .unwrap_or_default(),
                     )),
@@ -2213,7 +2222,7 @@ impl InnerSQLContext {
         }
 
         let projection_schema =
-            expressions_to_schema(projections, &schema_before, |duplicate_name: &str| {
+            expressions_to_schema(projections, schema_before, |duplicate_name: &str| {
                 format!("group_by aggregations contained duplicate output name '{duplicate_name}'")
             })?;
 
@@ -2255,7 +2264,7 @@ impl InnerSQLContext {
             } else if group_by_keys.iter().any(|k| is_simple_col_ref(k, key_name)) {
                 // Original col name in output - check if cross-aliased
                 let is_cross_aliased = projections.iter().any(|p| {
-                    p.to_field(&schema_before).is_ok_and(|f| f.name == key_name)
+                    p.to_field(schema_before).is_ok_and(|f| f.name == key_name)
                         && !is_simple_col_ref(p, key_name)
                 });
                 if is_cross_aliased {
@@ -2414,24 +2423,36 @@ impl InnerSQLContext {
 
     fn rename_columns_from_table_alias(
         &mut self,
-        mut lf: LazyFrame,
+        lf: LazyFrame,
         alias: &TableAlias,
     ) -> PolarsResult<LazyFrame> {
         if alias.columns.is_empty() {
             Ok(lf)
         } else {
-            let schema = self.get_frame_schema(&mut lf)?;
-            if alias.columns.len() != schema.len() {
-                polars_bail!(
-                    SQLSyntax: "number of columns ({}) in alias '{}' does not match the number of columns in the table/query ({})",
-                    alias.columns.len(), alias.name.value, schema.len()
-                )
-            } else {
-                let existing_columns: Vec<_> = schema.iter_names().collect();
-                let new_columns: Vec<_> =
-                    alias.columns.iter().map(|c| c.name.value.clone()).collect();
-                Ok(lf.rename(existing_columns, new_columns, true))
-            }
+            let new_columns: Vec<String> =
+                alias.columns.iter().map(|c| c.name.value.clone()).collect();
+            let alias_name = alias.name.value.clone();
+            let n_alias_cols = new_columns.len();
+
+            let cb = PlanCallback::new(
+                move |(mut plans, schemas): (Vec<DslPlan>, Vec<SchemaRef>)| {
+                    let lf = LazyFrame::from(plans.pop().unwrap());
+                    let schema = &schemas[0];
+
+                    if n_alias_cols != schema.len() {
+                        polars_bail!(
+                            SQLSyntax: "number of columns ({}) in alias '{}' does not match the number of columns in the table/query ({})",
+                            n_alias_cols, alias_name, schema.len()
+                        )
+                    }
+                    let existing_columns: Vec<_> = schema.iter_names().collect();
+                    Ok(lf
+                        .rename(existing_columns, new_columns.clone(), true)
+                        .logical_plan)
+                },
+            );
+
+            Ok(lf.pipe_with_schema(cb))
         }
     }
 }
