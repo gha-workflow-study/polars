@@ -513,7 +513,7 @@ def test_scan_cast_options_extra_columns(
     )
 
 
-@pytest.mark.parametrize("float_dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize("float_dtype", [*FLOAT_DTYPES])
 def test_scan_cast_options_integer_to_float(float_dtype: pl.DataType) -> None:
     df = pl.DataFrame({"a": [1]}, schema={"a": pl.Int64})
     f = io.BytesIO()
