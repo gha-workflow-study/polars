@@ -217,8 +217,6 @@ impl BytesBufferer {
 /// Runs of this many values whose total bytes are < `copy_buffer_reserve_size` will be copied into
 /// a single contiguous chunk.
 fn get_coalesce_run_length() -> usize {
-    use std::sync::LazyLock;
-
     return *COALESCE_RUN_LENGTH;
 
     static COALESCE_RUN_LENGTH: LazyLock<usize> = LazyLock::new(|| {
@@ -240,11 +238,11 @@ fn get_coalesce_run_length() -> usize {
 
         v
     });
+
+    use std::sync::LazyLock;
 }
 
 fn get_copy_buffer_size() -> NonZeroUsize {
-    use std::sync::LazyLock;
-
     return *COPY_BUFFER_SIZE;
 
     static COPY_BUFFER_SIZE: LazyLock<NonZeroUsize> = LazyLock::new(|| {
@@ -262,4 +260,6 @@ fn get_copy_buffer_size() -> NonZeroUsize {
 
         v
     });
+
+    use std::sync::LazyLock;
 }
