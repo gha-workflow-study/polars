@@ -18,15 +18,7 @@ pub(super) struct BytesBufferer {
 
 impl BytesBufferer {
     pub(super) fn new(target_output_size: usize) -> Self {
-        const MIN_COPY_BUFFER_RESERVE_SIZE: NonZeroUsize = NonZeroUsize::new(1024 * 1024).unwrap();
-        const TARGET_MAX_COPY_BUFFERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-
-        let min_copy_buffer_reserve_size =
-            usize::min(MIN_COPY_BUFFER_RESERVE_SIZE.get(), target_output_size);
-        let copy_buffer_reserve_size = usize::max(
-            min_copy_buffer_reserve_size,
-            target_output_size.div_ceil(TARGET_MAX_COPY_BUFFERS.get()),
-        );
+        let copy_buffer_reserve_size = usize::min(target_output_size, get_copy_buffer_size().get());
 
         BytesBufferer {
             target_output_size,
@@ -34,7 +26,10 @@ impl BytesBufferer {
             buffered_bytes: Vec::with_capacity(if target_output_size == 0 {
                 1
             } else {
-                2 * target_output_size.div_ceil(copy_buffer_reserve_size)
+                usize::max(
+                    target_output_size.div_ceil(copy_buffer_reserve_size),
+                    get_coalesce_run_length(),
+                )
             }),
             copy_buffer: vec![],
             copy_buffer_reserve_size,
@@ -227,19 +222,42 @@ fn get_coalesce_run_length() -> usize {
     return *COALESCE_RUN_LENGTH;
 
     static COALESCE_RUN_LENGTH: LazyLock<usize> = LazyLock::new(|| {
-        let v = std::env::var("POLARS_UPLOAD_COALESCE_RUN_LENGTH")
-            .map(|x| {
-                x.parse::<usize>()
-                    .ok()
-                    .filter(|x| *x >= 2)
-                    .unwrap_or_else(|| {
-                        panic!("invalid value for POLARS_UPLOAD_COALESCE_RUN_LENGTH: {x}")
-                    })
-            })
-            .unwrap_or(64);
+        let mut v: usize = 64;
+
+        if let Ok(x) = std::env::var("POLARS_UPLOAD_COALESCE_RUN_LENGTH") {
+            v = x
+                .parse::<usize>()
+                .ok()
+                .filter(|x| *x >= 2)
+                .unwrap_or_else(|| {
+                    panic!("invalid value for POLARS_UPLOAD_COALESCE_RUN_LENGTH: {x}")
+                })
+        }
 
         if polars_core::config::verbose() {
             eprintln!("upload coalesce_run_length: {v}")
+        }
+
+        v
+    });
+}
+
+fn get_copy_buffer_size() -> NonZeroUsize {
+    use std::sync::LazyLock;
+
+    return *COPY_BUFFER_SIZE;
+
+    static COPY_BUFFER_SIZE: LazyLock<NonZeroUsize> = LazyLock::new(|| {
+        let mut v: NonZeroUsize = const { NonZeroUsize::new(8 * 1024 * 1024).unwrap() };
+
+        if let Ok(x) = std::env::var("POLARS_UPLOAD_COPY_BUFFER_SIZE") {
+            v = x
+                .parse::<NonZeroUsize>()
+                .unwrap_or_else(|_| panic!("invalid value for POLARS_UPLOAD_COPY_BUFFER_SIZE: {x}"))
+        }
+
+        if polars_core::config::verbose() {
+            eprintln!("upload copy_buffer_size: {v}")
         }
 
         v
