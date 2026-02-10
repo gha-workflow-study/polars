@@ -127,8 +127,6 @@ impl std::io::Write for CloudWriterIoTraitWrap {
         let total_buf_len = buf.len();
         let buf: &mut &[u8] = &mut buf;
 
-        dbg!(buf.len());
-
         if let Some(writer) = self.get_writer_mut_from_ready_state() {
             let should_poll = writer.fill_buffer_from_slice(buf);
             if !should_poll {

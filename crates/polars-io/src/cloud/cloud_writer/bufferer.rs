@@ -239,7 +239,7 @@ fn get_coalesce_run_length() -> usize {
             .unwrap_or(64);
 
         if polars_core::config::verbose() {
-            eprintln!("POLARS_UPLOAD_COALESCE_RUN_LENGTH: {v}")
+            eprintln!("upload coalesce_run_length: {v}")
         }
 
         v
