@@ -8,7 +8,7 @@ use object_store::PutPayload;
 const COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 pub(super) struct BytesBufferer {
-    /// Buffer until this many bytes
+    /// Buffer until this many bytes. If set to `0`, buffering is disabled.
     target_output_size: usize,
     buffered_bytes: Vec<Bytes>,
     /// Copy bytes from small or borrowed (`&[u8]`) incoming buffers.
