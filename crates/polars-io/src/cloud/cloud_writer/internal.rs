@@ -35,11 +35,6 @@ pub(super) struct StartedState {
 
 impl InternalCloudWriter {
     pub(super) async fn start(&mut self) -> object_store::Result<()> {
-        self.get_or_init_started_state().await?;
-        Ok(())
-    }
-
-    async fn get_or_init_started_state(&mut self) -> object_store::Result<&mut StartedState> {
         if let State::NotStarted = &self.state {
             let multipart = self
                 .store
@@ -58,10 +53,21 @@ impl InternalCloudWriter {
             });
         }
 
-        match &mut self.state {
-            State::NotStarted => unreachable!(),
-            State::Started(state) => Ok(state),
-            State::Finished => panic!(),
+        Ok(())
+    }
+
+    async fn get_or_init_started_state(&mut self) -> object_store::Result<&mut StartedState> {
+        loop {
+            match &self.state {
+                State::Started(_) => {
+                    let State::Started(state) = &mut self.state else {
+                        unreachable!()
+                    };
+                    return Ok(state);
+                },
+                State::NotStarted => self.start().await?,
+                State::Finished => panic!(),
+            }
         }
     }
 

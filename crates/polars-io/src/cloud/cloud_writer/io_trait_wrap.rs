@@ -14,7 +14,7 @@ pub struct CloudWriterIoTraitWrap {
 }
 
 enum WriterState {
-    Idle(Box<CloudWriter>),
+    Ready(Box<CloudWriter>),
     Poll(
         Pin<Box<dyn Future<Output = std::io::Result<WriterState>> + Send + 'static>>,
         PollOperation,
@@ -39,8 +39,12 @@ impl<'a> Future for FinishActivePoll<'a> {
         match &mut *self.0 {
             WriterState::Poll(fut, operation) => match fut.poll_unpin(cx) {
                 Poll::Ready(Ok(new_state)) => {
-                    let operation = operation.clone();
-                    *self.0 = new_state;
+                    let WriterState::Poll(_, operation) =
+                        std::mem::replace(&mut *self.0, new_state)
+                    else {
+                        unreachable!()
+                    };
+
                     Poll::Ready(Ok(Some(operation)))
                 },
                 Poll::Ready(Err(e)) => {
@@ -50,7 +54,7 @@ impl<'a> Future for FinishActivePoll<'a> {
                 Poll::Pending => Poll::Pending,
             },
 
-            WriterState::Idle(_) | WriterState::Finished => Poll::Ready(Ok(None)),
+            WriterState::Ready(_) | WriterState::Finished => Poll::Ready(Ok(None)),
         }
     }
 }
@@ -61,11 +65,11 @@ impl CloudWriterIoTraitWrap {
     }
 
     fn take_writer_from_idle_state(&mut self) -> Option<Box<CloudWriter>> {
-        if !matches!(&self.state, WriterState::Idle(_)) {
+        if !matches!(&self.state, WriterState::Ready(_)) {
             return None;
         }
 
-        let WriterState::Idle(writer) = std::mem::replace(&mut self.state, WriterState::Finished)
+        let WriterState::Ready(writer) = std::mem::replace(&mut self.state, WriterState::Finished)
         else {
             unreachable!()
         };
@@ -74,7 +78,7 @@ impl CloudWriterIoTraitWrap {
     }
 
     fn get_writer_mut_from_idle_state(&mut self) -> Option<&mut CloudWriter> {
-        if let WriterState::Idle(writer) = &mut self.state {
+        if let WriterState::Ready(writer) = &mut self.state {
             Some(writer.as_mut())
         } else {
             None
@@ -85,16 +89,16 @@ impl CloudWriterIoTraitWrap {
         self.finish_active_poll().await?;
 
         match self.state {
-            WriterState::Idle(writer) => Ok(*writer),
+            WriterState::Ready(writer) => Ok(*writer),
             WriterState::Poll(..) => unreachable!(),
             WriterState::Finished => panic!(),
         }
     }
 
     pub fn as_cloud_writer(&mut self) -> std::io::Result<&mut CloudWriter> {
-        if !matches!(self.state, WriterState::Idle(_)) {
+        if !matches!(self.state, WriterState::Ready(_)) {
             match &mut self.state {
-                WriterState::Idle(_) => unreachable!(),
+                WriterState::Ready(_) => unreachable!(),
                 WriterState::Poll(..) => {
                     pl_async::get_runtime().block_in_place_on(self.finish_active_poll())?
                 },
@@ -102,7 +106,7 @@ impl CloudWriterIoTraitWrap {
             };
         }
 
-        let WriterState::Idle(writer) = &mut self.state else {
+        let WriterState::Ready(writer) = &mut self.state else {
             panic!()
         };
 
@@ -113,7 +117,7 @@ impl CloudWriterIoTraitWrap {
 impl From<CloudWriter> for CloudWriterIoTraitWrap {
     fn from(writer: CloudWriter) -> Self {
         Self {
-            state: WriterState::Idle(Box::new(writer)),
+            state: WriterState::Ready(Box::new(writer)),
         }
     }
 }
@@ -194,7 +198,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
 
             let fut = async move {
                 writer.flush_complete_chunk().await?;
-                Ok(WriterState::Idle(writer))
+                Ok(WriterState::Ready(writer))
             };
 
             self.state = WriterState::Poll(
@@ -224,7 +228,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
 
             let fut = async move {
                 writer.flush().await?;
-                Ok(WriterState::Idle(writer))
+                Ok(WriterState::Ready(writer))
             };
 
             self.state = WriterState::Poll(Box::pin(fut), PollOperation::Flush);

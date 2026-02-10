@@ -3,10 +3,6 @@ use std::num::NonZeroUsize;
 use bytes::Bytes;
 use object_store::PutPayload;
 
-/// Runs of this many values whose total bytes are < `copy_buffer_reserve_size` will be copied into
-/// a single contiguous chunk.
-const COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
-
 pub(super) struct BytesBufferer {
     /// Buffer until this many bytes. If set to `0`, buffering is disabled.
     target_output_size: usize,
@@ -89,7 +85,7 @@ impl BytesBufferer {
             self.reset_tail_coalecse_counters();
         }
 
-        if self.tail_coalesce_num_items >= COALESCE_RUN_LENGTH.get() {
+        if self.tail_coalesce_num_items >= get_coalesce_run_length() {
             self.coalesce_tail();
         }
     }
@@ -128,8 +124,6 @@ impl BytesBufferer {
     }
 
     fn coalesce_tail(&mut self) {
-        const { assert!(COALESCE_RUN_LENGTH.get() >= 2) }
-
         assert_eq!(self.copy_buffer.capacity(), 0);
 
         let n = self.tail_coalesce_num_items;
@@ -223,4 +217,31 @@ impl BytesBufferer {
 
         n
     }
+}
+
+/// Runs of this many values whose total bytes are < `copy_buffer_reserve_size` will be copied into
+/// a single contiguous chunk.
+fn get_coalesce_run_length() -> usize {
+    use std::sync::LazyLock;
+
+    return *COALESCE_RUN_LENGTH;
+
+    static COALESCE_RUN_LENGTH: LazyLock<usize> = LazyLock::new(|| {
+        let v = std::env::var("POLARS_UPLOAD_COALESCE_RUN_LENGTH")
+            .map(|x| {
+                x.parse::<usize>()
+                    .ok()
+                    .filter(|x| *x >= 2)
+                    .unwrap_or_else(|| {
+                        panic!("invalid value for POLARS_UPLOAD_COALESCE_RUN_LENGTH: {x}")
+                    })
+            })
+            .unwrap_or(64);
+
+        if polars_core::config::verbose() {
+            eprintln!("POLARS_UPLOAD_COALESCE_RUN_LENGTH: {v}")
+        }
+
+        v
+    });
 }
