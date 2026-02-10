@@ -3,9 +3,9 @@ use std::num::NonZeroUsize;
 use bytes::Bytes;
 use object_store::PutPayload;
 
-/// If the last `TAIL_COALESCE_RUN_LENGTH` buffered `Bytes` have a total length < `copy_buffer_reserve_size`,
-/// they are copied into one contiguous buffer.
-const TAIL_COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+/// Runs of this many values whose total bytes are < `copy_buffer_reserve_size` will be copied into
+/// a single contiguous chunk.
+const COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 pub(super) struct BytesBufferer {
     /// Buffer until this many bytes
@@ -89,7 +89,7 @@ impl BytesBufferer {
             self.reset_tail_coalecse_counters();
         }
 
-        if self.tail_coalesce_num_items >= TAIL_COALESCE_RUN_LENGTH.get() {
+        if self.tail_coalesce_num_items >= COALESCE_RUN_LENGTH.get() {
             self.coalesce_tail();
         }
     }
@@ -128,7 +128,7 @@ impl BytesBufferer {
     }
 
     fn coalesce_tail(&mut self) {
-        const { assert!(TAIL_COALESCE_RUN_LENGTH.get() >= 2) }
+        const { assert!(COALESCE_RUN_LENGTH.get() >= 2) }
 
         assert_eq!(self.copy_buffer.capacity(), 0);
 
