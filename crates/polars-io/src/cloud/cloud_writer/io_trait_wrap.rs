@@ -37,7 +37,7 @@ impl<'a> Future for FinishActivePoll<'a> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match &mut *self.0 {
-            WriterState::Poll(fut, operation) => match fut.poll_unpin(cx) {
+            WriterState::Poll(fut, _) => match fut.poll_unpin(cx) {
                 Poll::Ready(Ok(new_state)) => {
                     let WriterState::Poll(_, operation) =
                         std::mem::replace(&mut *self.0, new_state)
@@ -64,7 +64,7 @@ impl CloudWriterIoTraitWrap {
         FinishActivePoll(Pin::new(&mut self.state))
     }
 
-    fn take_writer_from_idle_state(&mut self) -> Option<Box<CloudWriter>> {
+    fn take_writer_from_ready_state(&mut self) -> Option<Box<CloudWriter>> {
         if !matches!(&self.state, WriterState::Ready(_)) {
             return None;
         }
@@ -77,7 +77,7 @@ impl CloudWriterIoTraitWrap {
         Some(writer)
     }
 
-    fn get_writer_mut_from_idle_state(&mut self) -> Option<&mut CloudWriter> {
+    fn get_writer_mut_from_ready_state(&mut self) -> Option<&mut CloudWriter> {
         if let WriterState::Ready(writer) = &mut self.state {
             Some(writer.as_mut())
         } else {
@@ -127,7 +127,9 @@ impl std::io::Write for CloudWriterIoTraitWrap {
         let total_buf_len = buf.len();
         let buf: &mut &[u8] = &mut buf;
 
-        if let Some(writer) = self.get_writer_mut_from_idle_state() {
+        dbg!(buf.len());
+
+        if let Some(writer) = self.get_writer_mut_from_ready_state() {
             let should_poll = writer.fill_buffer_from_slice(buf);
             if !should_poll {
                 assert!(buf.is_empty());
@@ -181,7 +183,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
                 None => 0,
             };
 
-            let writer = self.get_writer_mut_from_idle_state().unwrap();
+            let writer = self.get_writer_mut_from_ready_state().unwrap();
 
             let offset_buf: &mut &[u8] = &mut &buf[offset..];
 
@@ -194,7 +196,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
 
             let new_offset = buf.len() - offset_buf.len();
 
-            let mut writer = self.take_writer_from_idle_state().unwrap();
+            let mut writer = self.take_writer_from_ready_state().unwrap();
 
             let fut = async move {
                 writer.flush_complete_chunk().await?;
@@ -224,7 +226,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
                 }
             }
 
-            let mut writer = self.take_writer_from_idle_state().unwrap();
+            let mut writer = self.take_writer_from_ready_state().unwrap();
 
             let fut = async move {
                 writer.flush().await?;
@@ -248,7 +250,7 @@ impl tokio::io::AsyncWrite for CloudWriterIoTraitWrap {
                 }
             }
 
-            let Some(mut writer) = self.take_writer_from_idle_state() else {
+            let Some(mut writer) = self.take_writer_from_ready_state() else {
                 return Poll::Ready(Ok(()));
             };
 
