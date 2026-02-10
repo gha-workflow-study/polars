@@ -3,13 +3,18 @@ use std::num::NonZeroUsize;
 use bytes::Bytes;
 use object_store::PutPayload;
 
-const COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+/// If the last `TAIL_COALESCE_RUN_LENGTH` buffered `Bytes` have a total length < `copy_buffer_reserve_size`,
+/// they are copied into one contiguous buffer.
+const TAIL_COALESCE_RUN_LENGTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 pub(super) struct BytesBufferer {
+    /// Buffer until this many bytes
     target_output_size: usize,
     buffered_bytes: Vec<Bytes>,
+    /// Copy bytes from small or borrowed (`&[u8]`) incoming buffers.
     copy_buffer: Vec<u8>,
     copy_buffer_reserve_size: usize,
+    /// Total bytes buffered, includes both `buffered_bytes` and `copy_buffer.len()`.
     num_bytes_buffered: usize,
     tail_coalesce_num_items: usize,
     tail_coalesce_byte_offset: usize,
@@ -17,9 +22,15 @@ pub(super) struct BytesBufferer {
 
 impl BytesBufferer {
     pub(super) fn new(target_output_size: usize) -> Self {
-        let min_copy_buffer_reserve_size = usize::min(1024 * 1024, target_output_size);
-        let copy_buffer_reserve_size =
-            usize::max(min_copy_buffer_reserve_size, target_output_size.div_ceil(4));
+        const MIN_COPY_BUFFER_RESERVE_SIZE: NonZeroUsize = NonZeroUsize::new(1024 * 1024).unwrap();
+        const TARGET_MAX_COPY_BUFFERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+        let min_copy_buffer_reserve_size =
+            usize::min(MIN_COPY_BUFFER_RESERVE_SIZE.get(), target_output_size);
+        let copy_buffer_reserve_size = usize::max(
+            min_copy_buffer_reserve_size,
+            target_output_size.div_ceil(TARGET_MAX_COPY_BUFFERS.get()),
+        );
 
         BytesBufferer {
             target_output_size,
@@ -37,6 +48,8 @@ impl BytesBufferer {
         }
     }
 
+    /// Push owned [`Bytes`] into this bufferer. This will consume from a mutable reference
+    /// via [`Bytes::split_to`] until either the bytes is fully consumed, or `self` is full.
     pub(super) fn push_owned(&mut self, bytes: &mut Bytes) {
         if bytes.is_empty() {
             return;
@@ -76,11 +89,13 @@ impl BytesBufferer {
             self.reset_tail_coalecse_counters();
         }
 
-        if self.tail_coalesce_num_items >= COALESCE_RUN_LENGTH.get() {
+        if self.tail_coalesce_num_items >= TAIL_COALESCE_RUN_LENGTH.get() {
             self.coalesce_tail();
         }
     }
 
+    /// Push borrowed `&[u8]` into this bufferer. This will consume from a mutable reference
+    /// via `split_off` until either the slice is fully consumed, or `self` is full.
     pub(super) fn push_slice(&mut self, bytes: &mut &[u8]) {
         if bytes.is_empty() {
             return;
@@ -113,6 +128,8 @@ impl BytesBufferer {
     }
 
     fn coalesce_tail(&mut self) {
+        const { assert!(TAIL_COALESCE_RUN_LENGTH.get() >= 2) }
+
         assert_eq!(self.copy_buffer.capacity(), 0);
 
         let n = self.tail_coalesce_num_items;
